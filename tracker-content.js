@@ -86,6 +86,20 @@ function getOrCreateJourney(formId) {
       const val = JSON.stringify({ ...journey, formId, savedAt: Date.now() });
       sessionStorage.setItem(KEY, val);
       localStorage.setItem(KEY, val);
+      // cross-domain: write to extension storage so the tracker on other domains
+      // (e.g. HDFC's KYC page) can continue this journey within the 60s TTL
+      try {
+        if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+          chrome.storage.local.set({
+            fis_xdomain_journey: {
+              journeyId: journey.journeyId,
+              pageIndex: journey.pageCount,
+              savedAt: Date.now(),
+              fromHost: window.location.host,
+            },
+          });
+        }
+      } catch { /* ignore — extension context may be unavailable */ }
     };
 
     const clearStored = () => {
@@ -119,6 +133,16 @@ function getOrCreateJourney(formId) {
       const journey = { journeyId: urlJid, pageCount };
       saveJourney(journey);
       return { journeyId: urlJid, pageIndex: pageCount };
+    }
+
+    // cross-domain continuation — loaded by init() from chrome.storage.local before tracking starts
+    if (window.__FIS_XDOMAIN_JOURNEY) {
+      const xj = window.__FIS_XDOMAIN_JOURNEY;
+      window.__FIS_XDOMAIN_JOURNEY = null; // consume so only one page uses it
+      const pageCount = xj.pageIndex + 1;
+      const journey = { journeyId: xj.journeyId, pageCount };
+      saveJourney(journey);
+      return { journeyId: xj.journeyId, pageIndex: pageCount };
     }
 
     // new journey
@@ -741,13 +765,43 @@ function trackForm(formEl, serverBaseUrl) {
 
   try {
     const urlParams = new URLSearchParams(window.location.search);
-    const formId = urlParams.get('journeyId') || urlParams.get('bankJourneyID') || formEl?.dataset?.formId || window.location.pathname;
+    const formId = window.location.pathname;
     stripRefreshAbandon(); // must run before getOrCreateSession reads sessionStorage
     const session = getOrCreateSession(formId);
     // null means this is a post-submit page reload — skip tracking entirely
     // so the refreshed empty form doesn't create a phantom abandoned session
     if (!session) return;
     window.__fisSession = session; // dev helper — check tracker is active: window.__fisSession
+
+    // Store this session's ID in chrome.storage.local so the next page (on any domain)
+    // can retract this session's abandon if it detects it was a redirect, not a real abandon.
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+        chrome.storage.local.get('fis_xdomain_journey', (res) => {
+          const xj = res.fis_xdomain_journey || {};
+          chrome.storage.local.set({
+            fis_xdomain_journey: {
+              ...xj,
+              journeyId: session.journeyId,
+              pageIndex: session.pageIndex,
+              savedAt: Date.now(),
+              fromHost: window.location.host,
+              prevSessionId: session.sessionId,
+            },
+          });
+        });
+      }
+    } catch { /* ignore */ }
+
+    // If this page was reached via a cross-domain redirect, the previous session
+    // sent a form_abandon at pagehide (it didn't know a next page was coming).
+    // Retract that abandon now — the previous page's work was done, not abandoned.
+    if (window.__FIS_RETRACT_SESSION_ID) {
+      const retractId = window.__FIS_RETRACT_SESSION_ID;
+      window.__FIS_RETRACT_SESSION_ID = null;
+      postToServer(`${SERVER_BASE}/retract-abandon`, JSON.stringify({ sessionId: retractId }))
+        .catch(() => {});
+    }
 
     // Returns the name of the field the user was most recently interacting with.
     // Rules (in priority order):
@@ -1990,11 +2044,22 @@ function trackForm(formEl, serverBaseUrl) {
     // The popup's manual button sets __FIS_FORCE to start regardless of pins.
     var forced = window.__FIS_FORCE === true;
     if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-      chrome.storage.local.get(['serverUrl', 'pinnedUrls'], function(result) {
+      chrome.storage.local.get(['serverUrl', 'pinnedUrls', 'fis_xdomain_journey'], function(result) {
         if (result.serverUrl) {
           SERVER = result.serverUrl.replace(/\/$/, '');
           SERVER_BASE = SERVER;
           SERVER_URL = SERVER + '/events';
+        }
+        // if a cross-domain journey was saved recently (within 60s) from a different host,
+        // expose it so getOrCreateJourney can continue it instead of starting a new one
+        var xj = result.fis_xdomain_journey;
+        if (xj && xj.fromHost !== location.host && (Date.now() - xj.savedAt) < 60000) {
+          window.__FIS_XDOMAIN_JOURNEY = xj;
+          // the previous page sent form_abandon at pagehide not knowing we'd continue —
+          // retract it once trackForm runs and SERVER_BASE is set
+          if (xj.prevSessionId) {
+            window.__FIS_RETRACT_SESSION_ID = xj.prevSessionId;
+          }
         }
         var pinned = result.pinnedUrls || [];
         var host = location.host;

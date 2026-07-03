@@ -130,13 +130,15 @@ async function checkTrackerStatus() {
 
 pinBtn.addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const host = new URL(tab.url).host;
+  const { host } = new URL(tab.url);
   const { pinnedUrls = [] } = await chrome.storage.local.get('pinnedUrls');
   if (!pinnedUrls.includes(host)) {
     pinnedUrls.push(host);
     await chrome.storage.local.set({ pinnedUrls });
+    status.textContent = `Auto-tracking enabled for ${host} ✓`;
+  } else {
+    status.textContent = `Already tracking ${host}`;
   }
-  status.textContent = `Auto-tracking enabled for ${host} ✓`;
   status.className = 'ok';
   renderPinnedList();
 });

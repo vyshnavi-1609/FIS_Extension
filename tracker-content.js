@@ -2062,8 +2062,7 @@ function trackForm(formEl, serverBaseUrl) {
           }
         }
         var pinned = result.pinnedUrls || [];
-        var host = location.host;
-        if (forced || pinned.length === 0 || pinned.indexOf(host) !== -1) {
+        if (forced || pinned.indexOf(location.host) !== -1) {
           startTracking();
         }
       });
